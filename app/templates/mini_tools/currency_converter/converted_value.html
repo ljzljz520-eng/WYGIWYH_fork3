@@ -7,3 +7,12 @@
        name="to_value"
        id="to_value"
        disabled>
+{% if provenance %}
+  <p class="text-xs opacity-60 text-center">
+    {% blocktranslate with provider=provenance.provider effective_date=provenance.effective_date %}
+      Rate from {{ provider }}, effective {{ effective_date }}.
+    {% endblocktranslate %}
+  </p>
+{% elif status_message %}
+  <p class="text-xs text-warning text-center">{{ status_message }}</p>
+{% endif %}

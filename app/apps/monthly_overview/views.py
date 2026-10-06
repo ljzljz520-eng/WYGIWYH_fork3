@@ -9,6 +9,7 @@ from django.utils import timezone
 from django.views.decorators.http import require_http_methods
 
 from apps.common.decorators.htmx import only_htmx
+from apps.common.utils.dates import month_end
 from apps.common.utils.dicts import remove_falsey_entries
 from apps.monthly_overview.utils.daily_spending_allowance import (
     calculate_daily_allowance_currency,
@@ -166,7 +167,9 @@ def monthly_summary(request, month: int, year: int):
             .exclude(account__is_asset=True)
         )
 
-    data = calculate_currency_totals(queryset, ignore_empty=True)
+    data = calculate_currency_totals(
+        queryset, ignore_empty=True, as_of=month_end(year, month)
+    )
 
     percentages = calculate_percentage_distribution(data)
 
@@ -230,7 +233,9 @@ def monthly_account_summary(request, month: int, year: int):
             .exclude(account__in=request.user.untracked_accounts.all())
         )
 
-    account_data = calculate_account_totals(transactions_queryset=queryset.all())
+    account_data = calculate_account_totals(
+        transactions_queryset=queryset.all(), as_of=month_end(year, month)
+    )
     account_percentages = calculate_percentage_distribution(account_data)
 
     context = {
@@ -283,7 +288,9 @@ def monthly_currency_summary(request, month: int, year: int):
             .exclude(account__in=request.user.untracked_accounts.all())
         )
 
-    currency_data = calculate_currency_totals(queryset.all(), ignore_empty=True)
+    currency_data = calculate_currency_totals(
+        queryset.all(), ignore_empty=True, as_of=month_end(year, month)
+    )
     currency_percentages = calculate_percentage_distribution(currency_data)
 
     context = {

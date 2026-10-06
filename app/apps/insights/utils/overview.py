@@ -5,7 +5,7 @@ from django.db.models import Sum, Case, When, Value
 from django.db.models.functions import Coalesce
 
 from apps.currencies.models import Currency
-from apps.currencies.utils.convert import convert
+from apps.currencies.utils.rate_selection import resolve_rate
 from apps.transactions.models import Transaction
 
 # Grouping levels the overview can be built from. Any ordering of these keys is
@@ -89,7 +89,7 @@ def _aggregate(transactions_queryset, group_fields, name_field):
     )
 
 
-def _build_currency_data(metric, showing):
+def _build_currency_data(metric, showing, as_of):
     """Turn one aggregated row into the currency payload the templates read."""
     total_current = metric["income_current"] - metric["expense_current"]
     total_projected = metric["income_projected"] - metric["expense_projected"]
@@ -126,31 +126,45 @@ def _build_currency_data(metric, showing):
             id=metric["account__currency__exchange_currency"]
         )
 
-        exchanged = {}
-        for field in AGGREGATED_FIELDS + TOTAL_FIELDS:
-            amount, prefix, suffix, decimal_places = convert(
-                amount=currency_data[field],
-                from_currency=from_currency,
-                to_currency=exchange_currency,
-            )
-            if amount is not None:
-                exchanged[field] = amount
-                if "currency" not in exchanged:
-                    exchanged["currency"] = {
-                        "prefix": prefix,
-                        "suffix": suffix,
-                        "decimal_places": decimal_places,
-                        "code": exchange_currency.code,
-                        "name": exchange_currency.name,
-                    }
-        if exchanged:
-            currency_data["exchanged"] = exchanged
+        # Resolve one unit rate for the whole period; every field shares it.
+        rate_result = resolve_rate(
+            from_currency, exchange_currency, target=as_of
+        )
+        exchanged = {
+            "currency": {
+                "prefix": exchange_currency.prefix,
+                "suffix": exchange_currency.suffix,
+                "decimal_places": exchange_currency.decimal_places,
+                "code": exchange_currency.code,
+                "name": exchange_currency.name,
+            },
+            "status": rate_result.status.value,
+            "observation_id": rate_result.observation_id,
+            "revision": rate_result.revision,
+            "provider": rate_result.provenance.get("provider"),
+            "effective_date": rate_result.provenance.get("effective_date"),
+        }
+
+        if rate_result.is_ok:
+            for field in AGGREGATED_FIELDS + TOTAL_FIELDS:
+                exchanged[field] = currency_data[field] * rate_result.value
+        else:
+            # Explicit missing: no silent zero conversions.
+            for field in AGGREGATED_FIELDS + TOTAL_FIELDS:
+                exchanged[field] = None
+
+        currency_data["exchanged"] = exchanged
 
     return currency_data
 
 
 def get_grouped_totals(
-    transactions_queryset, levels, showing="final", ignore_empty=False, depth=1
+    transactions_queryset,
+    levels,
+    showing="final",
+    ignore_empty=False,
+    depth=1,
+    as_of=None,
 ):
     """
     Build a nested income/expense breakdown of ``transactions_queryset``.
@@ -203,7 +217,7 @@ def get_grouped_totals(
             },
         )
         node["currencies"][metric["account__currency"]] = _build_currency_data(
-            metric, showing
+            metric, showing, as_of
         )
 
     # Each extra level is aggregated on its own and grafted onto the node its
@@ -231,7 +245,7 @@ def get_grouped_totals(
                 },
             )
             child["currencies"][metric["account__currency"]] = _build_currency_data(
-                metric, showing
+                metric, showing, as_of
             )
 
     return result

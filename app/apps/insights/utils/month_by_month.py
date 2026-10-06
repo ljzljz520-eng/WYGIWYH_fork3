@@ -6,38 +6,80 @@ from django.db.models import Sum, Case, When, Value
 from django.db.models.functions import Coalesce
 from django.utils import timezone
 
+from apps.common.utils.dates import month_end
 from apps.currencies.models import Currency
-from apps.currencies.utils.convert import convert
+from apps.currencies.utils.rate_selection import resolve_conversion
 from apps.transactions.models import Transaction
+
+
+ConversionOK = "ok"
+
+
+def _currency_display(currency):
+    return {
+        "code": currency.code,
+        "name": currency.name,
+        "decimal_places": currency.decimal_places,
+        "prefix": currency.prefix,
+        "suffix": currency.suffix,
+    }
+
+
+def _resolve_exchanged(from_currency, to_currency, amount, as_of):
+    """Resolve one exchanged block as of a specific point in time."""
+    result = resolve_conversion(
+        amount, from_currency, to_currency, target=as_of
+    )
+    return {
+        "status": result.status.value,
+        "final_total": result.value if result.is_ok else None,
+        "currency": _currency_display(to_currency),
+        "observation_id": result.observation_id,
+        "revision": result.revision,
+        "effective_date": result.provenance.get("effective_date"),
+        "provider": result.provenance.get("provider"),
+        "batch_id": result.provenance.get("batch_id"),
+        "fallback": result.fallback,
+    }
+
+
+def _accumulate_exchanged(total_row, block):
+    """Accumulate a total from per-period exchanged blocks.
+
+    Totals are sums of period-level converted values (each period may use a
+    different observation); they are never produced with a single rate. When
+    any period is missing the total keeps the explicit missing status while
+    available converted values are still accumulated.
+    """
+    existing = total_row.get("exchanged")
+    if existing is None:
+        existing = {
+            "currency": block["currency"],
+            "final_total": None,
+            "status": ConversionOK,
+            "observation_ids": [],
+            "effective_dates": [],
+            "missing_periods": 0,
+        }
+        total_row["exchanged"] = existing
+
+    if block["status"] == ConversionOK:
+        existing["final_total"] = (
+            existing["final_total"] or Decimal("0")
+        ) + block["final_total"]
+        existing["observation_ids"].append(block["observation_id"])
+        existing["effective_dates"].append(block["effective_date"])
+    else:
+        existing["status"] = block["status"]
+        existing["missing_periods"] += 1
 
 
 def get_month_by_month_data(year=None, group_by="categories"):
     """
-    Aggregate transaction totals by month for a specific year, grouped by categories, tags, or entities.
-
-    Args:
-        year: The year to filter transactions (defaults to current year)
-        group_by: One of "categories", "tags", or "entities"
-
-    Returns:
-        {
-            "year": 2025,
-            "available_years": [2025, 2024, ...],
-            "months": [1, 2, 3, ..., 12],
-            "items": {
-                item_id: {
-                    "name": "Item Name",
-                    "month_totals": {
-                        1: {"currencies": {...}},
-                        ...
-                    },
-                    "total": {"currencies": {...}}
-                },
-                ...
-            },
-            "month_totals": {...},
-            "grand_total": {"currencies": {...}}
-        }
+    Aggregate transaction totals by month for a specific year, grouped by
+    categories, tags, or entities. Every monthly conversion resolves the
+    observation as of that month's end; higher-level totals accumulate the
+    monthly converted values.
     """
     if year is None:
         year = timezone.localdate(timezone.now()).year
@@ -131,14 +173,22 @@ def get_month_by_month_data(year=None, group_by="categories"):
         "grand_total": {"currencies": {}},
     }
 
-    # Store currency info for later use in totals
-    currency_info = {}
+    # Cache currency objects keyed by id.
+    currency_cache = {}
+
+    def get_currency(currency_id):
+        if currency_id not in currency_cache:
+            currency_cache[currency_id] = Currency.objects.get(id=currency_id)
+        return currency_cache[currency_id]
 
     for metric in metrics:
         item_id = metric[group_field]
         item_name = metric[name_field]
         month = metric["reference_date__month"]
         currency_id = metric["account__currency"]
+        exchange_currency_id = metric[
+            "account__currency__exchange_currency"
+        ]
 
         # Use a consistent key for None (uncategorized/untagged/no entity)
         item_key = item_id if item_id is not None else "__none__"
@@ -156,17 +206,6 @@ def get_month_by_month_data(year=None, group_by="categories"):
         # Calculate final total (income - expense)
         final_total = metric["income_total"] - metric["expense_total"]
 
-        # Store currency info for totals calculation
-        if currency_id not in currency_info:
-            currency_info[currency_id] = {
-                "code": metric["account__currency__code"],
-                "name": metric["account__currency__name"],
-                "decimal_places": metric["account__currency__decimal_places"],
-                "prefix": metric["account__currency__prefix"],
-                "suffix": metric["account__currency__suffix"],
-                "exchange_currency_id": metric["account__currency__exchange_currency"],
-            }
-
         currency_data = {
             "currency": {
                 "code": metric["account__currency__code"],
@@ -180,137 +219,68 @@ def get_month_by_month_data(year=None, group_by="categories"):
             "expense_total": metric["expense_total"],
         }
 
-        # Handle currency conversion if exchange currency is set
-        if metric["account__currency__exchange_currency"]:
-            from_currency = Currency.objects.get(id=currency_id)
-            exchange_currency = Currency.objects.get(
-                id=metric["account__currency__exchange_currency"]
+        # Point-in-time conversion as of this month's end.
+        if exchange_currency_id:
+            currency_data["exchanged"] = _resolve_exchanged(
+                get_currency(currency_id),
+                get_currency(exchange_currency_id),
+                final_total,
+                month_end(year, month),
             )
-
-            converted_amount, prefix, suffix, decimal_places = convert(
-                amount=final_total,
-                from_currency=from_currency,
-                to_currency=exchange_currency,
-            )
-
-            if converted_amount is not None:
-                currency_data["exchanged"] = {
-                    "final_total": converted_amount,
-                    "currency": {
-                        "prefix": prefix,
-                        "suffix": suffix,
-                        "decimal_places": decimal_places,
-                        "code": exchange_currency.code,
-                        "name": exchange_currency.name,
-                    },
-                }
 
         result["items"][item_key]["month_totals"][month]["currencies"][currency_id] = (
             currency_data
         )
 
-        # Accumulate item total (across all months for this item)
-        if currency_id not in result["items"][item_key]["total"]["currencies"]:
-            result["items"][item_key]["total"]["currencies"][currency_id] = {
-                "currency": currency_data["currency"].copy(),
-                "final_total": Decimal("0"),
-            }
-        result["items"][item_key]["total"]["currencies"][currency_id][
-            "final_total"
-        ] += final_total
-
-        # Accumulate month total (across all items for this month)
-        if month not in result["month_totals"]:
-            result["month_totals"][month] = {"currencies": {}}
-        if currency_id not in result["month_totals"][month]["currencies"]:
-            result["month_totals"][month]["currencies"][currency_id] = {
-                "currency": currency_data["currency"].copy(),
-                "final_total": Decimal("0"),
-            }
-        result["month_totals"][month]["currencies"][currency_id]["final_total"] += (
-            final_total
+        # Accumulate item total (native + exchanged across months).
+        item_total_row = (
+            result["items"][item_key]["total"]["currencies"]
+            .setdefault(
+                currency_id,
+                {
+                    "currency": currency_data["currency"].copy(),
+                    "final_total": Decimal("0"),
+                },
+            )
         )
-
-        # Accumulate grand total
-        if currency_id not in result["grand_total"]["currencies"]:
-            result["grand_total"]["currencies"][currency_id] = {
-                "currency": currency_data["currency"].copy(),
-                "final_total": Decimal("0"),
-            }
-        result["grand_total"]["currencies"][currency_id]["final_total"] += final_total
-
-    # Add currency conversion for item totals
-    for item_key, item_data in result["items"].items():
-        for currency_id, total_data in item_data["total"]["currencies"].items():
-            if currency_info[currency_id]["exchange_currency_id"]:
-                from_currency = Currency.objects.get(id=currency_id)
-                exchange_currency = Currency.objects.get(
-                    id=currency_info[currency_id]["exchange_currency_id"]
-                )
-                converted_amount, prefix, suffix, decimal_places = convert(
-                    amount=total_data["final_total"],
-                    from_currency=from_currency,
-                    to_currency=exchange_currency,
-                )
-                if converted_amount is not None:
-                    total_data["exchanged"] = {
-                        "final_total": converted_amount,
-                        "currency": {
-                            "prefix": prefix,
-                            "suffix": suffix,
-                            "decimal_places": decimal_places,
-                            "code": exchange_currency.code,
-                            "name": exchange_currency.name,
-                        },
-                    }
-
-    # Add currency conversion for month totals
-    for month, month_data in result["month_totals"].items():
-        for currency_id, total_data in month_data["currencies"].items():
-            if currency_info[currency_id]["exchange_currency_id"]:
-                from_currency = Currency.objects.get(id=currency_id)
-                exchange_currency = Currency.objects.get(
-                    id=currency_info[currency_id]["exchange_currency_id"]
-                )
-                converted_amount, prefix, suffix, decimal_places = convert(
-                    amount=total_data["final_total"],
-                    from_currency=from_currency,
-                    to_currency=exchange_currency,
-                )
-                if converted_amount is not None:
-                    total_data["exchanged"] = {
-                        "final_total": converted_amount,
-                        "currency": {
-                            "prefix": prefix,
-                            "suffix": suffix,
-                            "decimal_places": decimal_places,
-                            "code": exchange_currency.code,
-                            "name": exchange_currency.name,
-                        },
-                    }
-
-    # Add currency conversion for grand total
-    for currency_id, total_data in result["grand_total"]["currencies"].items():
-        if currency_info[currency_id]["exchange_currency_id"]:
-            from_currency = Currency.objects.get(id=currency_id)
-            exchange_currency = Currency.objects.get(
-                id=currency_info[currency_id]["exchange_currency_id"]
+        item_total_row["final_total"] += final_total
+        if exchange_currency_id:
+            _accumulate_exchanged(
+                item_total_row, currency_data["exchanged"]
             )
-            converted_amount, prefix, suffix, decimal_places = convert(
-                amount=total_data["final_total"],
-                from_currency=from_currency,
-                to_currency=exchange_currency,
+
+        # Accumulate month total.
+        month_total_row = (
+            result["month_totals"]
+            .setdefault(month, {"currencies": {}})["currencies"]
+            .setdefault(
+                currency_id,
+                {
+                    "currency": currency_data["currency"].copy(),
+                    "final_total": Decimal("0"),
+                },
             )
-            if converted_amount is not None:
-                total_data["exchanged"] = {
-                    "final_total": converted_amount,
-                    "currency": {
-                        "prefix": prefix,
-                        "suffix": suffix,
-                        "decimal_places": decimal_places,
-                        "code": exchange_currency.code,
-                        "name": exchange_currency.name,
-                    },
-                }
+        )
+        month_total_row["final_total"] += final_total
+        if exchange_currency_id:
+            _accumulate_exchanged(
+                month_total_row, currency_data["exchanged"]
+            )
+
+        # Accumulate grand total.
+        grand_total_row = (
+            result["grand_total"]["currencies"].setdefault(
+                currency_id,
+                {
+                    "currency": currency_data["currency"].copy(),
+                    "final_total": Decimal("0"),
+                },
+            )
+        )
+        grand_total_row["final_total"] += final_total
+        if exchange_currency_id:
+            _accumulate_exchanged(
+                grand_total_row, currency_data["exchanged"]
+            )
 
     return result

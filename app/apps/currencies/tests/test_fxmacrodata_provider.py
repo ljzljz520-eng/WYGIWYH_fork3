@@ -6,7 +6,7 @@ import requests
 
 from apps.currencies.exchange_rates.fetcher import PROVIDER_MAPPING
 from apps.currencies.exchange_rates.providers import FXMacroDataProvider
-from apps.currencies.models import ExchangeRateService
+from apps.currencies.models import ExchangeRateService, RateObservation
 
 
 class _FakeCurrency:
@@ -45,7 +45,17 @@ class FXMacroDataProviderTests(TestCase):
             rates = self.provider.get_rates([self.eur], {self.usd})
 
         mock_get.assert_called_once_with("https://api.fxmacrodata.com/v1/forex/USD/EUR")
-        self.assertEqual(rates, [(self.usd, self.eur, Decimal("0.8542"))])
+        self.assertEqual(len(rates), 1)
+        result = rates[0]
+        self.assertEqual(result.from_currency, self.usd)
+        self.assertEqual(result.to_currency, self.eur)
+        self.assertEqual(result.rate, Decimal("0.8542"))
+        self.assertEqual(
+            result.temporal_kind, RateObservation.TemporalKind.DAILY_FIXING
+        )
+        self.assertEqual(
+            result.effective_date.isoformat(), "2026-09-25"
+        )
 
     def test_skips_pair_without_rates(self):
         payload = {"data": [{"date": "2026-09-28", "val": None}]}

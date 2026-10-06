@@ -6,8 +6,9 @@ from django.shortcuts import render, redirect
 from django.utils.translation import gettext
 from django.views.decorators.http import require_http_methods
 
+from apps.common.utils.dates import month_end
 from apps.currencies.models import Currency
-from apps.currencies.utils.convert import convert
+from apps.currencies.utils.rate_selection import resolve_rate
 from apps.net_worth.utils.calculate_net_worth import (
     calculate_historical_currency_net_worth,
     calculate_historical_account_balance,
@@ -81,6 +82,7 @@ def net_worth(request):
     )
 
     datasets = []
+    consolidated_missing = {}
     currency_models = {
         currency.name: currency
         for currency in Currency.objects.filter(name__in=currencies).select_related(
@@ -114,24 +116,31 @@ def net_worth(request):
                 for source in currency_models.values()
                 if source.exchange_currency_id == target.id
             ]
-            rates = {}
-            for source in sources:
-                converted, _, _, _ = convert(1, source, target)
-                if converted is not None:
-                    rates[source.name] = converted
 
-            consolidated_data = [
-                float(
-                    round(
-                        month_data[currency]
-                        + sum(
-                            month_data[source] * rate for source, rate in rates.items()
-                        ),
-                        target.decimal_places,
+            # Each month resolves its own observation as of that month's end;
+            # a single rate is never stretched across the whole history.
+            consolidated_data = []
+            for label, month_data in historical_currency_net_worth.items():
+                label_date = historical_currency_net_worth.label_dates[label]
+                as_of = month_end(label_date.year, label_date.month)
+                converted_total = month_data[currency]
+
+                for source in sources:
+                    rate_result = resolve_rate(source, target, target=as_of)
+                    if rate_result.is_ok:
+                        converted_total += (
+                            month_data[source.name] * rate_result.value
+                        )
+                    else:
+                        consolidated_missing.setdefault(
+                            currency, {}
+                        ).setdefault(label, rate_result.status.value)
+
+                consolidated_data.append(
+                    float(
+                        round(converted_total, target.decimal_places)
                     )
                 )
-                for month_data in historical_currency_net_worth.values()
-            ]
             datasets.append(
                 {
                     "label": f"{currency} {gettext('Consolidated')}",
@@ -227,6 +236,7 @@ def net_worth(request):
             "accounts": accounts,
             "type": view_type,
             "chart_data_monthly_difference_json": chart_data_monthly_difference_json,
+            "consolidated_missing": consolidated_missing,
         },
     )
 

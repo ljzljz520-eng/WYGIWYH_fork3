@@ -1,9 +1,25 @@
+import datetime
 from abc import ABC, abstractmethod
+from dataclasses import dataclass, field
 from decimal import Decimal
-from typing import List, Tuple, Optional
+from typing import List, Optional
+
 from django.db.models import QuerySet
 
 from apps.currencies.models import Currency
+
+
+@dataclass
+class ProviderRate:
+    """One rate result as returned by a provider, with effective point."""
+
+    from_currency: Currency
+    to_currency: Currency
+    rate: Decimal
+    effective_at: datetime.datetime
+    effective_date: datetime.date
+    temporal_kind: str
+    derivation: dict = field(default_factory=dict)
 
 
 class ExchangeRateProvider(ABC):
@@ -15,7 +31,7 @@ class ExchangeRateProvider(ABC):
     @abstractmethod
     def get_rates(
         self, target_currencies: QuerySet, exchange_currencies: set
-    ) -> List[Tuple[Currency, Currency, Decimal]]:
+    ) -> List[ProviderRate]:
         """Fetch exchange rates for multiple currency pairs"""
         raise NotImplementedError("Subclasses must implement get_rates method")
 

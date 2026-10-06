@@ -1,16 +1,29 @@
+import datetime
 import logging
 import time
+from decimal import Decimal
+from typing import Dict, List, Optional, Tuple
+from zoneinfo import ZoneInfo
 
 import requests
-from decimal import Decimal
-from typing import Tuple, List, Optional, Dict
-
 from django.db.models import QuerySet
 
-from apps.currencies.models import Currency, ExchangeRate
-from apps.currencies.exchange_rates.base import ExchangeRateProvider
+from apps.currencies.exchange_rates.base import ExchangeRateProvider, ProviderRate
+from apps.currencies.models import Currency, RateObservation
 
 logger = logging.getLogger(__name__)
+
+# ECB reference rates (used by Frankfurter and FXMacroData) publish at about
+# 16:00 Europe/Berlin on TARGET business days.
+_PUBLISH_TZ = ZoneInfo("Europe/Berlin")
+_PUBLISH_TIME = datetime.time(16, 0)
+
+
+def _daily_effective_at(date_str: str) -> datetime.datetime:
+    effective_date = datetime.date.fromisoformat(date_str)
+    return datetime.datetime.combine(
+        effective_date, _PUBLISH_TIME, tzinfo=_PUBLISH_TZ
+    )
 
 
 class CoinGeckoFreeProvider(ExchangeRateProvider):
@@ -30,7 +43,7 @@ class CoinGeckoFreeProvider(ExchangeRateProvider):
 
     def get_rates(
         self, target_currencies: QuerySet, exchange_currencies: set
-    ) -> List[Tuple[Currency, Currency, Decimal]]:
+    ) -> List[ProviderRate]:
         results = []
         all_currencies = set(currency.code.lower() for currency in target_currencies)
         all_currencies.update(currency.code.lower() for currency in exchange_currencies)
@@ -46,6 +59,8 @@ class CoinGeckoFreeProvider(ExchangeRateProvider):
             response.raise_for_status()
             rates_data = response.json()
 
+            now = datetime.datetime.now(datetime.timezone.utc)
+
             for target_currency in target_currencies:
                 if target_currency.exchange_currency in exchange_currencies:
                     try:
@@ -58,7 +73,14 @@ class CoinGeckoFreeProvider(ExchangeRateProvider):
                         )
                         # The rate is already inverted, so we don't need to invert it again
                         results.append(
-                            (target_currency.exchange_currency, target_currency, rate)
+                            ProviderRate(
+                                from_currency=target_currency.exchange_currency,
+                                to_currency=target_currency,
+                                rate=rate,
+                                effective_at=now,
+                                effective_date=now.date(),
+                                temporal_kind=RateObservation.TemporalKind.REALTIME,
+                            )
                         )
                     except KeyError:
                         logger.error(
@@ -89,7 +111,7 @@ class CoinGeckoProProvider(CoinGeckoFreeProvider):
 
 
 class TransitiveRateProvider(ExchangeRateProvider):
-    """Calculates exchange rates through paths of existing rates"""
+    """Calculates exchange rates through paths of existing observations."""
 
     rates_inverted = True
 
@@ -102,14 +124,14 @@ class TransitiveRateProvider(ExchangeRateProvider):
 
     def get_rates(
         self, target_currencies: QuerySet, exchange_currencies: set
-    ) -> List[Tuple[Currency, Currency, Decimal]]:
+    ) -> List[ProviderRate]:
         results = []
 
-        # Get recent rates for building the graph
-        recent_rates = ExchangeRate.objects.all()
+        # Build graph from the newest observation per directed pair.
+        edges = self._latest_edges()
+        currency_graph, edge_observations = self._build_currency_graph(edges)
 
-        # Build currency graph
-        currency_graph = self._build_currency_graph(recent_rates)
+        now = datetime.datetime.now(datetime.timezone.utc)
 
         for target in target_currencies:
             if (
@@ -122,14 +144,32 @@ class TransitiveRateProvider(ExchangeRateProvider):
             from_id = target.exchange_currency.id
             to_id = target.id
 
-            path, rate = self._find_conversion_path(currency_graph, from_id, to_id)
+            path, rate, obs_ids = self._find_conversion_path(
+                currency_graph, edge_observations, from_id, to_id
+            )
 
             if path and rate:
-                path_codes = [Currency.objects.get(id=cid).code for cid in path]
+                path_codes = [
+                    Currency.objects.get(id=cid).code for cid in path
+                ]
                 logger.info(
                     f"Found conversion path: {' -> '.join(path_codes)}, rate: {rate}"
                 )
-                results.append((target.exchange_currency, target, rate))
+                results.append(
+                    ProviderRate(
+                        from_currency=target.exchange_currency,
+                        to_currency=target,
+                        rate=rate,
+                        effective_at=now,
+                        effective_date=now.date(),
+                        temporal_kind=RateObservation.TemporalKind.TRANSITIVE,
+                        derivation={
+                            "path_ids": path,
+                            "path_codes": path_codes,
+                            "observation_ids": obs_ids,
+                        },
+                    )
+                )
             else:
                 logger.debug(
                     f"No conversion path found for {target.exchange_currency.code}->{target.code}"
@@ -138,45 +178,65 @@ class TransitiveRateProvider(ExchangeRateProvider):
         return results
 
     @staticmethod
-    def _build_currency_graph(rates) -> Dict[int, Dict[int, Decimal]]:
-        """Build a graph representation of currency relationships"""
-        graph = {}
-
-        for rate in rates:
-            # Add both directions to make the graph bidirectional
-            if rate.from_currency_id not in graph:
-                graph[rate.from_currency_id] = {}
-            graph[rate.from_currency_id][rate.to_currency_id] = rate.rate
-
-            if rate.to_currency_id not in graph:
-                graph[rate.to_currency_id] = {}
-            graph[rate.to_currency_id][rate.from_currency_id] = Decimal("1") / rate.rate
-
-        return graph
+    def _latest_edges() -> List[RateObservation]:
+        """Return the most recent observation for each directed pair."""
+        latest: Dict[Tuple[int, int], RateObservation] = {}
+        for observation in RateObservation.objects.all().order_by(
+            "-effective_at", "-revision", "-id"
+        ):
+            key = (observation.from_currency_id, observation.to_currency_id)
+            if key not in latest:
+                latest[key] = observation
+        return list(latest.values())
 
     @staticmethod
-    def _find_conversion_path(
-        graph, from_id, to_id
-    ) -> Tuple[Optional[list], Optional[Decimal]]:
-        """Find the shortest path between currencies using breadth-first search"""
-        if from_id not in graph or to_id not in graph:
-            return None, None
+    def _build_currency_graph(observations):
+        """Build bidirectional graph plus the observation behind each edge."""
+        graph: Dict[int, Dict[int, Decimal]] = {}
+        edge_obs: Dict[Tuple[int, int], int] = {}
 
-        queue = [(from_id, [from_id], Decimal("1"))]
+        for obs in observations:
+            if obs.from_currency_id not in graph:
+                graph[obs.from_currency_id] = {}
+            graph[obs.from_currency_id][obs.to_currency_id] = obs.rate
+            edge_obs[(obs.from_currency_id, obs.to_currency_id)] = obs.id
+
+            if obs.to_currency_id not in graph:
+                graph[obs.to_currency_id] = {}
+            graph[obs.to_currency_id][obs.from_currency_id] = Decimal("1") / obs.rate
+            edge_obs[(obs.to_currency_id, obs.from_currency_id)] = obs.id
+
+        return graph, edge_obs
+
+    @staticmethod
+    def _find_conversion_path(graph, edge_obs, from_id, to_id):
+        """BFS shortest path; return path, rate and constituent observation IDs."""
+        if from_id not in graph or to_id not in graph:
+            return None, None, None
+
+        queue = [(from_id, [from_id], Decimal("1"), [])]
         visited = {from_id}
 
         while queue:
-            current, path, current_rate = queue.pop(0)
+            current, path, current_rate, obs_ids = queue.pop(0)
 
             if current == to_id:
-                return path, current_rate
+                return path, current_rate, obs_ids
 
             for neighbor, rate in graph.get(current, {}).items():
                 if neighbor not in visited:
                     visited.add(neighbor)
-                    queue.append((neighbor, path + [neighbor], current_rate * rate))
+                    observation_id = edge_obs[(current, neighbor)]
+                    queue.append(
+                        (
+                            neighbor,
+                            path + [neighbor],
+                            current_rate * rate,
+                            obs_ids + [observation_id],
+                        )
+                    )
 
-        return None, None
+        return None, None, None
 
 
 class FrankfurterProvider(ExchangeRateProvider):
@@ -201,8 +261,8 @@ class FrankfurterProvider(ExchangeRateProvider):
 
     def get_rates(
         self, target_currencies: QuerySet, exchange_currencies: set
-    ) -> List[Tuple[Currency, Currency, Decimal]]:
-        results = []
+    ) -> List[ProviderRate]:
+        results: List[ProviderRate] = []
         currency_groups = {}
         # Group target currencies by their exchange (base) currency to minimize API calls
         for currency in target_currencies:
@@ -225,8 +285,16 @@ class FrankfurterProvider(ExchangeRateProvider):
                     # Handle the case where the only request is for the base rate (e.g., USD to USD)
                     for currency in currencies:
                         if currency.code == base_currency:
+                            now = datetime.datetime.now(datetime.timezone.utc)
                             results.append(
-                                (currency.exchange_currency, currency, Decimal("1"))
+                                ProviderRate(
+                                    from_currency=currency.exchange_currency,
+                                    to_currency=currency,
+                                    rate=Decimal("1"),
+                                    effective_at=now,
+                                    effective_date=now.date(),
+                                    temporal_kind=RateObservation.TemporalKind.DAILY_FIXING,
+                                )
                             )
                     continue
 
@@ -237,6 +305,8 @@ class FrankfurterProvider(ExchangeRateProvider):
                 response.raise_for_status()
                 data = response.json()
                 rates = data["rates"]
+                effective_at = _daily_effective_at(data["date"])
+                effective_date = effective_at.date()
 
                 # Process the returned rates
                 for currency in currencies:
@@ -246,7 +316,16 @@ class FrankfurterProvider(ExchangeRateProvider):
                     else:
                         rate = Decimal(str(rates[currency.code]))
 
-                    results.append((currency.exchange_currency, currency, rate))
+                    results.append(
+                        ProviderRate(
+                            from_currency=currency.exchange_currency,
+                            to_currency=currency,
+                            rate=rate,
+                            effective_at=effective_at,
+                            effective_date=effective_date,
+                            temporal_kind=RateObservation.TemporalKind.DAILY_FIXING,
+                        )
+                    )
 
             except requests.RequestException as e:
                 logger.error(
@@ -285,16 +364,16 @@ class TwelveDataProvider(ExchangeRateProvider):
 
     def get_rates(
         self, target_currencies: QuerySet, exchange_currencies: set
-    ) -> List[Tuple[Currency, Currency, Decimal]]:
+    ) -> List[ProviderRate]:
         """
         Fetches exchange rates from the Twelve Data API for the given currency pairs.
 
         This provider makes one API call for each requested currency pair.
         """
-        results = []
+        results: List[ProviderRate] = []
 
         for target_currency in target_currencies:
-            # Ensure the target currency's exchange currency is one we're interested in
+            # Ensure the target currency's exchange currency is one we are interested in
             if target_currency.exchange_currency not in exchange_currencies:
                 continue
 
@@ -302,8 +381,17 @@ class TwelveDataProvider(ExchangeRateProvider):
 
             # The exchange rate for the same currency is always 1
             if base_currency.code == target_currency.code:
-                rate = Decimal("1")
-                results.append((base_currency, target_currency, rate))
+                now = datetime.datetime.now(datetime.timezone.utc)
+                results.append(
+                    ProviderRate(
+                        from_currency=base_currency,
+                        to_currency=target_currency,
+                        rate=Decimal("1"),
+                        effective_at=now,
+                        effective_date=now.date(),
+                        temporal_kind=RateObservation.TemporalKind.REALTIME,
+                    )
+                )
                 continue
 
             # Construct the symbol in the format "BASE/TARGET", e.g., "EUR/USD"
@@ -330,7 +418,17 @@ class TwelveDataProvider(ExchangeRateProvider):
 
                 # Convert the rate to a Decimal for precision
                 rate = Decimal(str(data["rate"]))
-                results.append((base_currency, target_currency, rate))
+                now = datetime.datetime.now(datetime.timezone.utc)
+                results.append(
+                    ProviderRate(
+                        from_currency=base_currency,
+                        to_currency=target_currency,
+                        rate=rate,
+                        effective_at=now,
+                        effective_date=now.date(),
+                        temporal_kind=RateObservation.TemporalKind.REALTIME,
+                    )
+                )
 
                 logger.info(f"Successfully fetched rate for {symbol} from Twelve Data.")
 
@@ -392,8 +490,8 @@ class TwelveDataMarketsProvider(ExchangeRateProvider):
 
     def get_rates(
         self, target_currencies: QuerySet, exchange_currencies: set
-    ) -> List[Tuple[Currency, Currency, Decimal]]:
-        results = []
+    ) -> List[ProviderRate]:
+        results: List[ProviderRate] = []
 
         for asset in target_currencies:
             if asset.exchange_currency not in exchange_currencies:
@@ -480,7 +578,17 @@ class TwelveDataMarketsProvider(ExchangeRateProvider):
                     conversion_rate = Decimal(str(rate_data["rate"]))
                     final_price = price_in_original_currency * conversion_rate
 
-                results.append((target_exchange_currency, asset, final_price))
+                now = datetime.datetime.now(datetime.timezone.utc)
+                results.append(
+                    ProviderRate(
+                        from_currency=target_exchange_currency,
+                        to_currency=asset,
+                        rate=final_price,
+                        effective_at=now,
+                        effective_date=now.date(),
+                        temporal_kind=RateObservation.TemporalKind.REALTIME,
+                    )
+                )
                 logger.info(
                     f"Successfully processed price for {asset.code} as {final_price} {target_exchange_currency.code}"
                 )
@@ -538,8 +646,8 @@ class YFinanceMarketsProvider(ExchangeRateProvider):
 
     def get_rates(
         self, target_currencies: QuerySet, exchange_currencies: set
-    ) -> List[Tuple[Currency, Currency, Decimal]]:
-        results = []
+    ) -> List[ProviderRate]:
+        results: List[ProviderRate] = []
         ticker_factory = self._get_ticker_factory()
 
         for asset in target_currencies:
@@ -559,23 +667,41 @@ class YFinanceMarketsProvider(ExchangeRateProvider):
                     continue
 
                 try:
-                    latest_close = history["Close"].dropna().iloc[-1]
+                    latest_bar = history["Close"].dropna().iloc[-1]
+                    latest_bar_time = history["Close"].dropna().index[-1]
                 except (IndexError, KeyError, TypeError):
                     logger.warning(
                         "YFinanceMarkets: no close price returned for %s", asset.code
                     )
                     continue
 
-                rate = Decimal(str(latest_close))
+                rate = Decimal(str(latest_bar))
                 if not rate.is_finite() or rate <= 0:
                     logger.warning(
                         "YFinanceMarkets: invalid close price %r for %s",
-                        latest_close,
-                        asset.code,
+                        latest_bar,
+                        asset.code
                     )
                     continue
 
-                results.append((exchange_currency, asset, rate))
+                # The bar timestamp carries the exchange timezone.
+                effective_at = latest_bar_time.to_pydatetime()
+                if effective_at.tzinfo is None:
+                    from django.utils import timezone as django_timezone
+
+                    effective_at = django_timezone.make_aware(effective_at)
+                effective_at_utc = effective_at.astimezone(datetime.timezone.utc)
+
+                results.append(
+                    ProviderRate(
+                        from_currency=exchange_currency,
+                        to_currency=asset,
+                        rate=rate,
+                        effective_at=effective_at_utc,
+                        effective_date=effective_at_utc.date(),
+                        temporal_kind=RateObservation.TemporalKind.REALTIME,
+                    )
+                )
             except Exception as exc:
                 logger.error(
                     "YFinanceMarkets: error fetching %s: %s", asset.code, exc
@@ -601,8 +727,8 @@ class FXMacroDataProvider(ExchangeRateProvider):
 
     def get_rates(
         self, target_currencies: QuerySet, exchange_currencies: set
-    ) -> List[Tuple[Currency, Currency, Decimal]]:
-        results = []
+    ) -> List[ProviderRate]:
+        results: List[ProviderRate] = []
 
         for target_currency in target_currencies:
             if target_currency.exchange_currency not in exchange_currencies:
@@ -611,7 +737,17 @@ class FXMacroDataProvider(ExchangeRateProvider):
             base_currency = target_currency.exchange_currency
 
             if base_currency.code == target_currency.code:
-                results.append((base_currency, target_currency, Decimal("1")))
+                now = datetime.datetime.now(datetime.timezone.utc)
+                results.append(
+                    ProviderRate(
+                        from_currency=base_currency,
+                        to_currency=target_currency,
+                        rate=Decimal("1"),
+                        effective_at=now,
+                        effective_date=now.date(),
+                        temporal_kind=RateObservation.TemporalKind.DAILY_FIXING,
+                    )
+                )
                 continue
 
             pair = f"{base_currency.code}/{target_currency.code}"
@@ -632,7 +768,18 @@ class FXMacroDataProvider(ExchangeRateProvider):
 
                 latest = max(rows, key=lambda row: row["date"])
                 rate = Decimal(str(latest["val"]))
-                results.append((base_currency, target_currency, rate))
+                effective_at = _daily_effective_at(latest["date"])
+
+                results.append(
+                    ProviderRate(
+                        from_currency=base_currency,
+                        to_currency=target_currency,
+                        rate=rate,
+                        effective_at=effective_at,
+                        effective_date=effective_at.date(),
+                        temporal_kind=RateObservation.TemporalKind.DAILY_FIXING,
+                    )
+                )
             except requests.RequestException as e:
                 logger.error(f"Error fetching rate from FXMacroData for {pair}: {e}")
             except KeyError as e:

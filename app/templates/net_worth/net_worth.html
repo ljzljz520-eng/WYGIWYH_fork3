@@ -124,6 +124,23 @@
             </c-ui.info-card>
           </div>
         </div>
+        {% if consolidated_missing %}
+          <div class="col lg:col-12">
+            <div class="alert alert-warning text-sm">
+              <i class="fa-solid fa-triangle-exclamation"></i>
+              <span>
+                {% trans "Some settled months could not be consolidated because of missing or stale rates:" %}
+                {% for target, months in consolidated_missing.items %}
+                  {{ target }}:
+                  {% for label, status in months.items %}
+                    {{ label }}
+                    ({% if status == "missing_stale" %}{% trans "stale" %}{% else %}{% trans "no observation" %}{% endif %}){% if not forloop.last %}, {% endif %}
+                  {% endfor %}{% if not forloop.last %};{% endif %}
+                {% endfor %}
+              </span>
+            </div>
+          </div>
+        {% endif %}
         <div class="col lg:col-7">
           <div class="card bg-base-100">
             <div class="card-body">

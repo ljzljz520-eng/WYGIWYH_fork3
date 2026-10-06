@@ -31,7 +31,7 @@ from apps.insights.utils.sankey import (
     generate_sankey_data_by_account,
     generate_sankey_data_by_currency,
 )
-from apps.insights.utils.transactions import get_transactions
+from apps.insights.utils.transactions import get_period_end, get_transactions
 from apps.insights.utils.year_by_year import get_year_by_year_data
 from apps.insights.utils.month_by_month import get_month_by_month_data
 from apps.transactions.models import TransactionCategory, Transaction
@@ -283,6 +283,7 @@ def overview_results(request):
         showing=showing,
         ignore_empty=False,
         depth=len(levels),
+        as_of=get_period_end(request),
     )
 
     return render(

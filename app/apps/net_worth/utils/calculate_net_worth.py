@@ -13,6 +13,14 @@ from apps.currencies.models import Currency
 from apps.transactions.models import Transaction
 
 
+class HistoricalNetWorth(OrderedDict):
+    """Ordered monthly totals, plus a label -> first-of-month date mapping."""
+
+    def __init__(self):
+        super().__init__()
+        self.label_dates = {}
+
+
 def calculate_historical_currency_net_worth(queryset):
     # Get all currencies and date range in a single query
     aggregates = queryset.aggregate(
@@ -73,7 +81,7 @@ def calculate_historical_currency_net_worth(queryset):
         balance_dict[month][currency] = b["balance"]
 
     # Initialize the result dictionary
-    historical_net_worth = OrderedDict()
+    historical_net_worth = HistoricalNetWorth()
 
     # Calculate running totals for each month
     running_totals = {currency: Decimal("0.00") for currency in currencies}
@@ -94,6 +102,7 @@ def calculate_historical_currency_net_worth(queryset):
 
         if totals_changed or not historical_net_worth:
             historical_net_worth[month_str] = running_totals.copy()
+            historical_net_worth.label_dates[month_str] = current_month
             last_recorded_totals = running_totals.copy()
 
         current_month += relativedelta(months=1)
@@ -102,7 +111,9 @@ def calculate_historical_currency_net_worth(queryset):
     if historical_net_worth and list(historical_net_worth.keys())[-1] != date_filter(
         end_date, "b Y"
     ):
-        historical_net_worth[date_filter(end_date, "b Y")] = last_recorded_totals
+        end_label = date_filter(end_date, "b Y")
+        historical_net_worth[end_label] = last_recorded_totals
+        historical_net_worth.label_dates[end_label] = end_date
 
     return historical_net_worth
 

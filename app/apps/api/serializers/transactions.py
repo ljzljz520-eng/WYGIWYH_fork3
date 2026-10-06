@@ -216,5 +216,8 @@ class TransactionSerializer(serializers.ModelSerializer):
         return instance
 
     @staticmethod
-    def get_exchanged_amount(obj) -> Decimal:
+    def get_exchanged_amount(obj) -> dict | None:
+        # Includes status, converted amount and the adopted observation
+        # provenance (observation id, revision, provider, effective date,
+        # batch id, direction, fallback flag).
         return obj.exchanged_amount()

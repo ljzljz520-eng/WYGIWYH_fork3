@@ -22,7 +22,8 @@ class CurrencyViewSet(viewsets.ModelViewSet):
     ordering_fields = '__all__'
 
 
-class ExchangeRateViewSet(viewsets.ModelViewSet):
+class ExchangeRateViewSet(viewsets.ReadOnlyModelViewSet):
+    # Legacy table is frozen read-only after migration to RateObservation.
     queryset = ExchangeRate.objects.all()
     serializer_class = ExchangeRateSerializer
     filterset_fields = {

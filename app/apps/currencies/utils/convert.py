@@ -1,44 +1,28 @@
 import datetime
-
-from django.db.models import Func, F, Value, Case, When, DecimalField, Q
-from django.db.models.functions import Extract
-from django.utils import timezone
+from types import SimpleNamespace
 
 from apps.currencies.models import Currency
-from apps.currencies.models import ExchangeRate
+from apps.currencies.utils.rate_selection import resolve_conversion, resolve_rate
 
 
 def get_exchange_rate(
     from_currency: Currency, to_currency: Currency, date: datetime.date
-) -> ExchangeRate | None:
-    try:
-        exchange_rate = (
-            ExchangeRate.objects.filter(
-                Q(from_currency=from_currency, to_currency=to_currency)
-                | Q(from_currency=to_currency, to_currency=from_currency)
-            )
-            .annotate(
-                date_diff=Func(
-                    Extract(F("date") - Value(date), "epoch"), function="ABS"
-                ),
-                effective_rate=Case(
-                    When(from_currency=from_currency, then=F("rate")),
-                    default=1 / F("rate"),
-                    output_field=DecimalField(),
-                ),
-            )
-            .order_by("date_diff")
-            .first()
-        )
+):
+    """Return the resolved observation as a backward-compatible shim.
 
-        if exchange_rate is None:
-            return None
-
-    except ExchangeRate.DoesNotExist:
+    The shim exposes ``effective_rate`` (rate in the requested direction) and
+    ``date`` (the observation's effective point), mirroring the previous API.
+    Returns None when no usable observation exists.
+    """
+    result = resolve_rate(from_currency, to_currency, target=date)
+    if not result.is_ok:
         return None
 
-    else:
-        return exchange_rate
+    return SimpleNamespace(
+        effective_rate=result.value,
+        date=result.provenance["effective_at"],
+        pk=result.observation_id,
+    )
 
 
 def convert(amount, from_currency: Currency, to_currency: Currency, date=None):
@@ -48,18 +32,18 @@ def convert(amount, from_currency: Currency, to_currency: Currency, date=None):
     if amount == 0:
         return None, None, None, None
 
-    if date is None:
-        date = timezone.localtime(timezone.now())
-
-    exchange_rate = get_exchange_rate(
-        from_currency=from_currency, to_currency=to_currency, date=date
+    result = resolve_conversion(
+        amount=amount,
+        from_currency=from_currency,
+        to_currency=to_currency,
+        target=date,
     )
 
-    if exchange_rate is None:
+    if not result.is_ok:
         return None, None, None, None
 
     return (
-        amount * exchange_rate.effective_rate,
+        result.value,
         to_currency.prefix,
         to_currency.suffix,
         to_currency.decimal_places,

@@ -4,6 +4,17 @@
   <div class="card-body">
     <h5 class="card-title mb-4">
       {{ currency.currency.name }}
+      {% if currency.exchanged and currency.exchanged.status and currency.exchanged.status != "ok" %}
+        <span class="badge badge-warning text-xs"
+              data-tippy-content="{% if currency.exchanged.status == 'missing_stale' %}{% trans 'Only a stale rate is available' %}{% else %}{% trans 'No rate observation available' %}{% endif %}">
+          <i class="fa-solid fa-triangle-exclamation"></i>
+          {% if currency.exchanged.status == "missing_stale" %}
+            {% trans "stale rate" %}
+          {% else %}
+            {% trans "rate missing" %}
+          {% endif %}
+        </span>
+      {% endif %}
     </h5>
     <div class="card-data-section">
       <div class="card-data-row">

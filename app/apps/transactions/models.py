@@ -14,7 +14,7 @@ from apps.common.models import (
     SharedObjectManager,
 )
 from apps.common.templatetags.decimal import drop_trailing_zeros, localize_number
-from apps.currencies.utils.convert import convert
+from apps.currencies.utils.rate_selection import resolve_conversion
 from apps.transactions.storage import PrivateMediaStorage
 from apps.transactions.validators import validate_decimal_places, validate_non_negative
 from dateutil.relativedelta import relativedelta
@@ -463,36 +463,42 @@ class Transaction(OwnedObject):
         super().delete(*args, **kwargs)
 
     def exchanged_amount(self):
-        if self.account.exchange_currency:
-            converted_amount, prefix, suffix, decimal_places = convert(
-                self.amount,
-                to_currency=self.account.exchange_currency,
-                from_currency=self.account.currency,
-                date=self.date,
-            )
-            if converted_amount:
-                return {
-                    "amount": converted_amount,
-                    "prefix": prefix,
-                    "suffix": suffix,
-                    "decimal_places": decimal_places,
-                }
-        elif self.account.currency.exchange_currency:
-            converted_amount, prefix, suffix, decimal_places = convert(
-                self.amount,
-                to_currency=self.account.currency.exchange_currency,
-                from_currency=self.account.currency,
-                date=self.date,
-            )
-            if converted_amount:
-                return {
-                    "amount": converted_amount,
-                    "prefix": prefix,
-                    "suffix": suffix,
-                    "decimal_places": decimal_places,
-                }
+        """Return the converted amount with selection provenance.
 
-        return None
+        A dict is returned whenever a target exchange currency is configured,
+        even when no usable observation exists; callers must branch on
+        ``status``. ``amount`` is None for the explicit missing states.
+        """
+        account = self.account
+        target_currency = (
+            account.exchange_currency or account.currency.exchange_currency
+        )
+        if target_currency is None:
+            return None
+
+        result = resolve_conversion(
+            self.amount,
+            account.currency,
+            target_currency,
+            target=self.date,
+        )
+
+        return {
+            "status": result.status.value,
+            "amount": result.value if result.is_ok else None,
+            "prefix": target_currency.prefix,
+            "suffix": target_currency.suffix,
+            "decimal_places": target_currency.decimal_places,
+            "observation_id": result.observation_id,
+            "revision": result.revision,
+            "direction": (
+                result.direction.value if result.direction else None
+            ),
+            "provider": result.provenance.get("provider"),
+            "effective_date": result.provenance.get("effective_date"),
+            "batch_id": result.provenance.get("batch_id"),
+            "fallback": result.fallback,
+        }
 
     def __str__(self):
         type_display = self.get_type_display()

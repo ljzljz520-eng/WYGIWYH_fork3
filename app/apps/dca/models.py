@@ -6,7 +6,7 @@ from django.utils import timezone
 from django.utils.translation import gettext_lazy as _
 
 from apps.common.models import SharedObject, SharedObjectManager
-from apps.currencies.utils.convert import convert, get_exchange_rate
+from apps.currencies.utils.rate_selection import resolve_rate
 
 
 class DCAStrategy(SharedObject):
@@ -136,16 +136,15 @@ class DCAStrategy(SharedObject):
         }
 
     def current_price(self):
-        exchange_rate = get_exchange_rate(
-            from_currency=self.target_currency,
-            to_currency=self.payment_currency,
-            date=timezone.localtime(timezone.now()),
+        result = resolve_rate(
+            self.target_currency,
+            self.payment_currency,
+            target=timezone.now(),
         )
 
-        if exchange_rate:
-            return exchange_rate.effective_rate, exchange_rate.date
-        else:
-            return None
+        if result.is_ok:
+            return result.value, result.provenance
+        return None
 
 
 class DCAEntry(models.Model):
@@ -203,13 +202,15 @@ class DCAEntry(models.Model):
         if not self.amount_received:
             return Decimal("0")
 
-        amount, _, _, _ = convert(
-            self.amount_received,
+        result = resolve_rate(
             self.strategy.target_currency,
             self.strategy.payment_currency,
+            target=timezone.now(),
         )
 
-        return amount or Decimal("0")
+        if result.is_ok:
+            return self.amount_received * result.value
+        return Decimal("0")
 
     def profit_loss(self):
         """Calculate P/L in payment currency"""

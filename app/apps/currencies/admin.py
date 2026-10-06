@@ -26,4 +26,16 @@ class ExchangeRateServiceAdmin(admin.ModelAdmin):
     filter_horizontal = ["target_currencies"]
 
 
-admin.site.register(ExchangeRate)
+@admin.register(ExchangeRate)
+class ExchangeRateAdmin(admin.ModelAdmin):
+    # Frozen read-only audit table; new data lives in RateObservation.
+    list_display = ["date", "from_currency", "to_currency", "rate"]
+
+    def has_add_permission(self, request):
+        return False
+
+    def has_change_permission(self, request, obj=None):
+        return False
+
+    def has_delete_permission(self, request, obj=None):
+        return False

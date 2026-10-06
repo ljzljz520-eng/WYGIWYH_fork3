@@ -4,6 +4,7 @@ from django.utils import timezone
 from dateutil.relativedelta import relativedelta
 
 from apps.transactions.models import Transaction
+from apps.common.utils.dates import month_end, year_end
 from apps.insights.forms import (
     SingleMonthForm,
     SingleYearForm,
@@ -11,6 +12,56 @@ from apps.insights.forms import (
     YearRangeForm,
     DateRangeForm,
 )
+
+
+def get_period_end(request):
+    """End date of the period selected in the request (defaults to current month)."""
+    filter_type = request.GET.get("type")
+
+    if filter_type == "month":
+        form = SingleMonthForm(request.GET)
+        month = (
+            form.cleaned_data["month"]
+            if form.is_valid()
+            else timezone.localdate()
+        )
+        return month_end(month.year, month.month)
+
+    if filter_type == "year":
+        form = SingleYearForm(request.GET)
+        year = (
+            form.cleaned_data["year"].year
+            if form.is_valid()
+            else timezone.localdate().year
+        )
+        return year_end(year)
+
+    if filter_type == "month-range":
+        form = MonthRangeForm(request.GET)
+        if form.is_valid():
+            month_to = form.cleaned_data["month_to"]
+        else:
+            month_to = timezone.localdate()
+        return month_end(month_to.year, month_to.month)
+
+    if filter_type == "year-range":
+        form = YearRangeForm(request.GET)
+        year_to = (
+            form.cleaned_data["year_to"].year
+            if form.is_valid()
+            else timezone.localdate().year
+        )
+        return year_end(year_to)
+
+    if filter_type == "date-range":
+        form = DateRangeForm(request.GET)
+        if form.is_valid():
+            return form.cleaned_data["date_to"]
+        today = timezone.localdate()
+        return month_end(today.year, today.month)
+
+    today = timezone.localdate()
+    return month_end(today.year, today.month)
 
 
 def get_transactions(

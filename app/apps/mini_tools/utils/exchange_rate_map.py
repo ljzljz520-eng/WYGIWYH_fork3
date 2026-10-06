@@ -1,85 +1,73 @@
 from typing import Dict
 
-from django.db.models import Func, F, Value
-from django.db.models.functions import Extract
-from django.utils import timezone
-
-from apps.currencies.models import ExchangeRate
+from apps.currencies.models import Currency, RateObservation
+from apps.currencies.utils.rate_selection import normalize_target, resolve_rate
 
 
 def get_currency_exchange_map(date=None) -> Dict[str, dict]:
     """
-    Creates a nested dictionary of exchange rates and currency information.
+    Build a nested dictionary of currently valid, as-of-now rates.
 
-    Returns:
-    {
-        'BTC': {
-            'decimal_places': 8,
-            'prefix': '₿',
-            'suffix': '',
-            'rates': {'USD': Decimal('34000.00'), 'EUR': Decimal('31000.00')}
-        },
-        'USD': {
-            'decimal_places': 2,
-            'prefix': '$',
-            'suffix': '',
-            'rates': {'BTC': Decimal('0.0000294'), 'EUR': Decimal('0.91')}
-        },
-        ...
-    }
+    Every entry carries provenance (observation id, provider, effective
+    date). Missing pairs are omitted rather than silently producing a
+    future or stale value.
     """
-    if date is None:
-        date = timezone.localtime(timezone.now())
+    target = normalize_target(date)
 
-    # Get all exchange rates for the closest date
-    exchange_rates = (
-        ExchangeRate.objects.select_related(
-            "from_currency", "to_currency"
-        )  # Optimize currency queries
-        .annotate(
-            date_diff=Func(Extract(F("date") - Value(date), "epoch"), function="ABS"),
-            effective_rate=F("rate"),
-        )
-        .order_by("from_currency", "to_currency", "-date_diff")
+    currencies = {currency.id: currency for currency in Currency.objects.all()}
+
+    # Pairs are derived from observations rather than from a mutable table.
+    pairs = (
+        RateObservation.objects.order_by("from_currency_id", "to_currency_id")
+        .values_list("from_currency_id", "to_currency_id")
         .distinct()
     )
 
-    # Initialize the result dictionary
     rate_map = {}
 
-    # Build the exchange rate mapping with currency info
-    for rate in exchange_rates:
-        # Add from_currency info if not exists
-        if rate.from_currency.name not in rate_map:
-            rate_map[rate.from_currency.name] = {
-                "decimal_places": rate.from_currency.decimal_places,
-                "prefix": rate.from_currency.prefix,
-                "suffix": rate.from_currency.suffix,
+    def _slot(currency):
+        if currency.name not in rate_map:
+            rate_map[currency.name] = {
+                "decimal_places": currency.decimal_places,
+                "prefix": currency.prefix,
+                "suffix": currency.suffix,
                 "rates": {},
             }
 
-        # Add to_currency info if not exists
-        if rate.to_currency.name not in rate_map:
-            rate_map[rate.to_currency.name] = {
-                "decimal_places": rate.to_currency.decimal_places,
-                "prefix": rate.to_currency.prefix,
-                "suffix": rate.to_currency.suffix,
-                "rates": {},
-            }
+    def _entry(result, target_currency):
+        provenance = result.provenance
+        return {
+            "rate": result.value,
+            "decimal_places": target_currency.decimal_places,
+            "prefix": target_currency.prefix,
+            "suffix": target_currency.suffix,
+            "observation_id": provenance.get("observation_id"),
+            "provider": provenance.get("provider"),
+            "effective_date": provenance.get("effective_date"),
+        }
 
-        # Add direct rate
-        rate_map[rate.from_currency.name]["rates"][rate.to_currency.name] = {
-            "rate": rate.rate,
-            "decimal_places": rate.to_currency.decimal_places,
-            "prefix": rate.to_currency.prefix,
-            "suffix": rate.to_currency.suffix,
-        }
-        # Add inverse rate
-        rate_map[rate.to_currency.name]["rates"][rate.from_currency.name] = {
-            "rate": 1 / rate.rate,
-            "decimal_places": rate.from_currency.decimal_places,
-            "prefix": rate.from_currency.prefix,
-            "suffix": rate.from_currency.suffix,
-        }
+    for from_id, to_id in pairs:
+        source = currencies.get(from_id)
+        target_currency = currencies.get(to_id)
+        if source is None or target_currency is None:
+            continue
+
+        direct = resolve_rate(source, target_currency, target=target)
+        if not direct.is_ok:
+            continue
+
+        reverse = resolve_rate(target_currency, source, target=target)
+
+        _slot(source)
+        _slot(target_currency)
+
+        rate_map[source.name]["rates"][target_currency.name] = _entry(
+            direct, target_currency
+        )
+        if reverse.is_ok:
+            # Same observation, high precision reciprocal.
+            rate_map[target_currency.name]["rates"][source.name] = _entry(
+                reverse, source
+            )
 
     return rate_map

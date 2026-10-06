@@ -1,9 +1,11 @@
 from django.contrib.auth.decorators import login_required
 from django.shortcuts import render
 
+from django.utils.translation import gettext
+
 from apps.common.widgets.decimal import convert_to_decimal
 from apps.currencies.models import Currency
-from apps.currencies.utils.convert import convert
+from apps.currencies.utils.rate_selection import resolve_conversion
 from apps.mini_tools.forms import CurrencyConverterForm
 from apps.mini_tools.utils.exchange_rate_map import get_currency_exchange_map
 
@@ -38,12 +40,33 @@ def currency_converter_convert(request):
     if from_value:
         from_value = convert_to_decimal(from_value)
 
+    provenance = None
+    status_message = ""
     if from_currency and to_currency and from_value:
-        converted_amount, prefix, suffix, decimal_places = convert(
-            amount=from_value,
-            from_currency=from_currency,
-            to_currency=to_currency,
+        result = resolve_conversion(
+            from_value,
+            from_currency,
+            to_currency,
         )
+        if result.is_ok:
+            converted_amount = result.value
+            prefix = to_currency.prefix
+            suffix = to_currency.suffix
+            decimal_places = to_currency.decimal_places
+            provenance = result.provenance
+        else:
+            converted_amount = None
+            prefix = ""
+            suffix = ""
+            decimal_places = 0
+            if result.status.value == "missing_stale":
+                status_message = gettext(
+                    "Only a stale rate is available for this currency pair."
+                )
+            else:
+                status_message = gettext(
+                    "No rate observation available for this currency pair."
+                )
     else:
         converted_amount = None
         prefix = ""
@@ -58,5 +81,7 @@ def currency_converter_convert(request):
             "prefix": prefix,
             "suffix": suffix,
             "decimal_places": decimal_places,
+            "provenance": provenance,
+            "status_message": status_message,
         },
     )

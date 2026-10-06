@@ -6,6 +6,7 @@ from django.utils import timezone
 
 from apps.accounts.models import Account
 from apps.common.decorators.htmx import only_htmx
+from apps.common.utils.dates import month_end, year_end
 from apps.common.utils.dicts import remove_falsey_entries
 from apps.currencies.models import Currency
 from apps.transactions.models import Transaction
@@ -99,7 +100,8 @@ def yearly_overview_by_currency(request, year: int):
         .order_by("account__currency__name")
     )
 
-    data = calculate_currency_totals(transactions)
+    as_of = month_end(year, month) if month else year_end(year)
+    data = calculate_currency_totals(transactions, as_of=as_of)
     percentages = calculate_percentage_distribution(data)
 
     return render(
@@ -170,7 +172,8 @@ def yearly_overview_by_account(request, year: int):
         )
     )
 
-    data = calculate_account_totals(transactions)
+    as_of = month_end(year, month) if month else year_end(year)
+    data = calculate_account_totals(transactions, as_of=as_of)
     percentages = calculate_percentage_distribution(data)
 
     return render(

@@ -4,7 +4,12 @@ from django.db.models import QuerySet
 from django.utils import timezone
 
 import apps.currencies.exchange_rates.providers as providers
-from apps.currencies.models import ExchangeRateService, ExchangeRate, Currency
+from apps.currencies.models import (
+    ExchangeRateService,
+    Currency,
+    RateFetchBatch,
+    RateObservation,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -106,7 +111,9 @@ class ExchangeRateFetcher:
             try:
                 if force:
                     logger.info(f"Force fetching rates for {service.name}")
-                    ExchangeRateFetcher._fetch_service_rates(service)
+                    ExchangeRateFetcher._fetch_service_rates(
+                        service, trigger=RateFetchBatch.Trigger.MANUAL
+                    )
                     continue
 
                 # Check if service should fetch based on interval type
@@ -117,7 +124,9 @@ class ExchangeRateFetcher:
                         f"Interval type: {service.interval_type}, "
                         f"Current hour: {current_hour}"
                     )
-                    ExchangeRateFetcher._fetch_service_rates(service)
+                    ExchangeRateFetcher._fetch_service_rates(
+                        service, trigger=RateFetchBatch.Trigger.SCHEDULE
+                    )
                 else:
                     logger.debug(
                         f"Skipping {service.name}. "
@@ -166,14 +175,30 @@ class ExchangeRateFetcher:
         return target_currencies_qs, exchange_currencies
 
     @staticmethod
-    def _fetch_service_rates(service: ExchangeRateService) -> None:
-        """Fetch rates for a specific service"""
+    def _fetch_service_rates(
+        service: ExchangeRateService,
+        trigger: str = RateFetchBatch.Trigger.MANUAL,
+    ) -> None:
+        """Fetch rates for a specific service.
+
+        Every returned rate is stored as a new immutable RateObservation;
+        historical observations are never updated.
+        """
+        batch = RateFetchBatch.objects.create(
+            service=service,
+            trigger=trigger,
+            started_at=timezone.now(),
+        )
+
         try:
             provider = service.get_provider()
 
             # Check if API key is required but missing
             if provider.requires_api_key() and not service.api_key:
                 logger.error(f"API key required but not provided for {service.name}")
+                ExchangeRateFetcher._finish_batch(
+                    batch, RateFetchBatch.Status.FAILED, 0, 0, "Missing API key"
+                )
                 return
 
             # Get unique currency pairs from both sources
@@ -184,85 +209,88 @@ class ExchangeRateFetcher:
             # Skip if no currencies to process
             if not target_currencies or not exchange_currencies:
                 logger.info(f"No currency pairs to process for service {service.name}")
+                ExchangeRateFetcher._finish_batch(
+                    batch, RateFetchBatch.Status.FAILED, 0, 0, "No currency pairs"
+                )
                 return
 
             rates = provider.get_rates(target_currencies, exchange_currencies)
+            rates_received = len(rates)
 
             # Track processed currency pairs to avoid duplicates
             processed_pairs = set()
+            rates_stored = 0
+            fetched_at = timezone.now()
+            current_observation = None
 
-            for from_currency, to_currency, rate in rates:
+            for provider_rate in rates:
+                from_currency = provider_rate.from_currency
+                to_currency = provider_rate.to_currency
+
                 # Create a unique identifier for this currency pair
                 pair_key = (from_currency.id, to_currency.id)
                 if pair_key in processed_pairs:
                     continue
+                processed_pairs.add(pair_key)
 
-                if provider.rates_inverted:
-                    # If rates are inverted, we need to swap currencies
-                    if service.singleton:
-                        # Try to get the last automatically created exchange rate
-                        exchange_rate = (
-                            ExchangeRate.objects.filter(
-                                automatic=True,
-                                from_currency=to_currency,
-                                to_currency=from_currency,
-                            )
-                            .order_by("-date")
-                            .first()
-                        )
-                    else:
-                        exchange_rate = None
+                observation_source = (
+                    RateObservation.Source.TRANSITIVE
+                    if provider_rate.temporal_kind
+                    == RateObservation.TemporalKind.TRANSITIVE
+                    else RateObservation.Source.AUTOMATIC_FETCH
+                )
+                observation = RateObservation.objects.create(
+                    from_currency=from_currency,
+                    to_currency=to_currency,
+                    rate=provider_rate.rate,
+                    provider=service.service_type or "unknown",
+                    service=service,
+                    batch=batch,
+                    fetched_at=fetched_at,
+                    effective_at=provider_rate.effective_at,
+                    effective_date=provider_rate.effective_date,
+                    temporal_kind=provider_rate.temporal_kind,
+                    source=observation_source,
+                    revision=1,
+                    derivation=provider_rate.derivation or {},
+                )
+                rates_stored += 1
+                current_observation = observation
 
-                    if not exchange_rate:
-                        ExchangeRate.objects.create(
-                            automatic=True,
-                            from_currency=to_currency,
-                            to_currency=from_currency,
-                            rate=rate,
-                            date=timezone.now(),
-                        )
-                    else:
-                        exchange_rate.rate = rate
-                        exchange_rate.date = timezone.now()
-                        exchange_rate.save()
-
-                    processed_pairs.add((to_currency.id, from_currency.id))
-                else:
-                    # If rates are not inverted, we can use them as is
-                    if service.singleton:
-                        # Try to get the last automatically created exchange rate
-                        exchange_rate = (
-                            ExchangeRate.objects.filter(
-                                automatic=True,
-                                from_currency=from_currency,
-                                to_currency=to_currency,
-                            )
-                            .order_by("-date")
-                            .first()
-                        )
-                    else:
-                        exchange_rate = None
-
-                    if not exchange_rate:
-                        ExchangeRate.objects.create(
-                            automatic=True,
-                            from_currency=from_currency,
-                            to_currency=to_currency,
-                            rate=rate,
-                            date=timezone.now(),
-                        )
-                    else:
-                        exchange_rate.rate = rate
-                        exchange_rate.date = timezone.now()
-                        exchange_rate.save()
-
-                    processed_pairs.add((from_currency.id, to_currency.id))
-
-            service.last_fetch = timezone.now()
+            service.current_observation = current_observation
+            service.last_fetch = fetched_at
             service.failure_count = 0
             service.save()
 
+            if rates_stored == 0:
+                status = RateFetchBatch.Status.FAILED
+            elif rates_stored < rates_received:
+                status = RateFetchBatch.Status.PARTIAL
+            else:
+                status = RateFetchBatch.Status.SUCCESS
+
+            ExchangeRateFetcher._finish_batch(
+                batch, status, rates_received, rates_stored
+            )
+
         except Exception as e:
             logger.error(f"Error fetching rates for {service.name}: {e}")
+            ExchangeRateFetcher._finish_batch(
+                batch,
+                RateFetchBatch.Status.FAILED,
+                batch.rates_received or 0,
+                batch.rates_stored or 0,
+                str(e),
+            )
             service.failure_count += 1
             service.save()
+
+    @staticmethod
+    def _finish_batch(batch, status, rates_received, rates_stored, error_summary=""):
+        batch.status = status
+        batch.rates_received = rates_received
+        batch.rates_stored = rates_stored
+        batch.finished_at = timezone.now()
+        if error_summary:
+            batch.error_summary = error_summary[:255]
+        batch.save()

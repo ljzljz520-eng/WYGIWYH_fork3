@@ -3,7 +3,7 @@ from django.contrib.auth.decorators import login_required
 from django.core.paginator import Paginator
 from django.db.models import CharField, Value
 from django.db.models.functions import Concat
-from django.http import HttpResponse
+from django.http import HttpResponse, HttpResponseForbidden
 from django.shortcuts import render, get_object_or_404
 from django.utils.translation import gettext_lazy as _
 from django.views.decorators.http import require_http_methods
@@ -78,24 +78,22 @@ def exchange_rates_list_pair(request):
     )
 
 
+# The legacy table is frozen as a read-only audit table; manual entries
+# are now immutable RateObservation rows created through the revision flow.
+FROZEN_MESSAGE = _(
+    "Legacy exchange rates are frozen and can no longer be modified."
+)
+
+
 @only_htmx
 @login_required
 @require_http_methods(["GET", "POST"])
 def exchange_rate_add(request):
     if request.method == "POST":
-        form = ExchangeRateForm(request.POST)
-        if form.is_valid():
-            form.save()
-            messages.success(request, _("Exchange rate added successfully"))
+        messages.error(request, FROZEN_MESSAGE)
+        return HttpResponseForbidden(FROZEN_MESSAGE)
 
-            return HttpResponse(
-                status=204,
-                headers={
-                    "HX-Trigger": "updated, hide_offcanvas",
-                },
-            )
-    else:
-        form = ExchangeRateForm()
+    form = ExchangeRateForm()
 
     return render(
         request,
@@ -111,19 +109,10 @@ def exchange_rate_edit(request, pk):
     exchange_rate = get_object_or_404(ExchangeRate, id=pk)
 
     if request.method == "POST":
-        form = ExchangeRateForm(request.POST, instance=exchange_rate)
-        if form.is_valid():
-            form.save()
-            messages.success(request, _("Exchange rate updated successfully"))
+        messages.error(request, FROZEN_MESSAGE)
+        return HttpResponseForbidden(FROZEN_MESSAGE)
 
-            return HttpResponse(
-                status=204,
-                headers={
-                    "HX-Trigger": "updated, hide_offcanvas",
-                },
-            )
-    else:
-        form = ExchangeRateForm(instance=exchange_rate)
+    form = ExchangeRateForm(instance=exchange_rate)
 
     return render(
         request,
@@ -136,15 +125,8 @@ def exchange_rate_edit(request, pk):
 @login_required
 @require_http_methods(["DELETE"])
 def exchange_rate_delete(request, pk):
-    exchange_rate = get_object_or_404(ExchangeRate, id=pk)
+    get_object_or_404(ExchangeRate, id=pk)
 
-    exchange_rate.delete()
+    messages.error(request, FROZEN_MESSAGE)
 
-    messages.success(request, _("Exchange rate deleted successfully"))
-
-    return HttpResponse(
-        status=204,
-        headers={
-            "HX-Trigger": "updated, hide_offcanvas",
-        },
-    )
+    return HttpResponseForbidden(FROZEN_MESSAGE)

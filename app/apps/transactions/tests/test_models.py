@@ -13,7 +13,7 @@ from apps.transactions.models import (
     RecurringTransaction,
 )
 from apps.accounts.models import Account, AccountGroup
-from apps.currencies.models import Currency, ExchangeRate
+from apps.currencies.models import Currency, RateObservation
 
 
 class TransactionCategoryTests(TestCase):
@@ -64,12 +64,18 @@ class TransactionTests(TestCase):
         self.account.exchange_currency = eur
         self.account.save()
 
-        # Create exchange rate
-        ExchangeRate.objects.create(
+        # Create an immutable rate observation
+        RateObservation.objects.create(
             from_currency=self.currency,
             to_currency=eur,
             rate=Decimal("0.85"),
-            date=timezone.now(),
+            provider="legacy:unknown",
+            fetched_at=timezone.now(),
+            effective_at=timezone.now(),
+            effective_date=timezone.localdate(),
+            temporal_kind=RateObservation.TemporalKind.DAILY_FIXING,
+            source=RateObservation.Source.LEGACY_MIGRATION,
+            revision=1,
         )
 
         transaction = Transaction.objects.create(
@@ -82,6 +88,29 @@ class TransactionTests(TestCase):
 
         exchanged = transaction.exchanged_amount()
         self.assertIsNotNone(exchanged)
+        self.assertEqual(exchanged["status"], "ok")
+        self.assertEqual(exchanged["prefix"], "€")
+        self.assertIsNotNone(exchanged["observation_id"])
+
+    def test_exchanged_amount_reports_explicit_missing_state(self):
+        eur = Currency.objects.create(
+            code="EUR", name="Euro", decimal_places=2, prefix="€"
+        )
+        self.account.exchange_currency = eur
+        self.account.save()
+
+        # No rate observation exists for this pair.
+        transaction = Transaction.objects.create(
+            account=self.account,
+            type=Transaction.Type.EXPENSE,
+            date=timezone.now().date(),
+            amount=Decimal("100.00"),
+            description="Test transaction",
+        )
+
+        exchanged = transaction.exchanged_amount()
+        self.assertEqual(exchanged["status"], "missing_no_observation")
+        self.assertIsNone(exchanged["amount"])
         self.assertEqual(exchanged["prefix"], "€")
 
     def test_truncating_amount(self):

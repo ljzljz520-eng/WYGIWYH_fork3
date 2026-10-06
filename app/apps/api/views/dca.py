@@ -39,9 +39,22 @@ class DCAStrategyViewSet(viewsets.ModelViewSet):
         strategy = self.get_object()
         price_data = strategy.current_price()
         if price_data:
-            price, date = price_data
-            return Response({"price": price, "date": date})
-        return Response({"price": None, "date": None})
+            price, provenance = price_data
+            return Response(
+                {
+                    "price": price,
+                    "date": provenance.get("effective_date"),
+                    "provenance": provenance,
+                }
+            )
+        return Response(
+            {
+                "price": None,
+                "date": None,
+                "provenance": None,
+                "status": "missing_no_observation",
+            }
+        )
 
 
 class DCAEntryViewSet(viewsets.ModelViewSet):

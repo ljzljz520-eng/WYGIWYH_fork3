@@ -5,12 +5,70 @@ from django.db.models import Q, Sum, Case, When, Value, F
 from django.db.models.functions import Coalesce
 
 from apps.transactions.models import Transaction
-from apps.currencies.utils.convert import convert
 from apps.currencies.models import Currency
+from apps.currencies.utils.rate_selection import (
+    ConversionStatus,
+    resolve_rate,
+)
+
+
+CONVERTED_FIELDS = [
+    "expense_current",
+    "expense_projected",
+    "income_current",
+    "income_projected",
+    "total_current",
+    "total_projected",
+    "total_final",
+]
+
+
+def _currency_display(currency):
+    return {
+        "code": currency.code,
+        "name": currency.name,
+        "decimal_places": currency.decimal_places,
+        "prefix": currency.prefix,
+        "suffix": currency.suffix,
+    }
+
+
+def _build_exchanged_block(from_currency, to_currency, source_data, as_of):
+    """Build an exchanged block from one shared observation.
+
+    Every converted field shares the same point-in-time observation, so the
+    unit rate is resolved once. Missing states are explicit: the fields are
+    ``None`` instead of silently becoming zero.
+    """
+    result = resolve_rate(from_currency, to_currency, target=as_of)
+    details = {"currency": _currency_display(to_currency)}
+
+    if result.is_ok:
+        for field in CONVERTED_FIELDS:
+            details[field] = source_data[field] * result.value
+    else:
+        for field in CONVERTED_FIELDS:
+            details[field] = None
+
+    details.update(
+        {
+            "status": result.status.value,
+            "observation_id": result.observation_id,
+            "revision": result.revision,
+            "provider": result.provenance.get("provider"),
+            "effective_date": result.provenance.get("effective_date"),
+            "batch_id": result.provenance.get("batch_id"),
+            "fallback": result.fallback,
+        }
+    )
+    return details
 
 
 def calculate_currency_totals(
-    transactions_queryset, ignore_empty=False, deep_search=False
+    transactions_queryset,
+    ignore_empty=False,
+    deep_search=False,
+    as_of=None,
 ):
     # Prepare the aggregation expressions
     currency_totals_from_transactions = (
@@ -149,33 +207,12 @@ def calculate_currency_totals(
         }
 
         if exchange_currency_obj_for_this_total:
-            exchanged_details = {
-                "currency": {
-                    "code": exchange_currency_obj_for_this_total.code,
-                    "name": exchange_currency_obj_for_this_total.name,
-                    "decimal_places": exchange_currency_obj_for_this_total.decimal_places,
-                    "prefix": exchange_currency_obj_for_this_total.prefix,
-                    "suffix": exchange_currency_obj_for_this_total.suffix,
-                }
-            }
-            for field in [
-                "expense_current",
-                "expense_projected",
-                "income_current",
-                "income_projected",
-                "total_current",
-                "total_projected",
-                "total_final",
-            ]:
-                amount_to_convert = currency_data[field]
-                converted_val, _, _, _ = convert(
-                    amount=amount_to_convert,
-                    from_currency=from_currency_obj,
-                    to_currency=exchange_currency_obj_for_this_total,
-                )
-                exchanged_details[field] = (
-                    converted_val if converted_val is not None else Decimal("0")
-                )
+            exchanged_details = _build_exchanged_block(
+                from_currency_obj,
+                exchange_currency_obj_for_this_total,
+                currency_data,
+                as_of,
+            )
 
             currency_data["exchanged"] = exchanged_details
 
@@ -211,49 +248,22 @@ def calculate_currency_totals(
                     continue
 
                 # Initialize data for this transaction-less exchange target currency
+                zero_data = {
+                    field: Decimal("0") for field in CONVERTED_FIELDS
+                }
                 currency_data_for_db_currency = {
-                    "currency": {
-                        "code": db_currency.code,
-                        "name": db_currency.name,
-                        "decimal_places": db_currency.decimal_places,
-                        "prefix": db_currency.prefix,
-                        "suffix": db_currency.suffix,
-                    },
-                    "expense_current": Decimal("0"),
-                    "expense_projected": Decimal("0"),
-                    "income_current": Decimal("0"),
-                    "income_projected": Decimal("0"),
-                    "total_current": Decimal("0"),
-                    "total_projected": Decimal("0"),
-                    "total_final": Decimal("0"),
+                    "currency": _currency_display(db_currency),
+                    **zero_data,
                 }
 
                 # If this newly added transaction-less currency ALSO has an exchange_currency set for itself
                 if db_currency.exchange_currency:
-                    exchanged_details_for_db_currency = {
-                        "currency": {
-                            "code": db_currency.exchange_currency.code,
-                            "name": db_currency.exchange_currency.name,
-                            "decimal_places": db_currency.exchange_currency.decimal_places,
-                            "prefix": db_currency.exchange_currency.prefix,
-                            "suffix": db_currency.exchange_currency.suffix,
-                        }
-                    }
-                    for field in [
-                        "expense_current",
-                        "expense_projected",
-                        "income_current",
-                        "income_projected",
-                        "total_current",
-                        "total_projected",
-                        "total_final",
-                    ]:
-                        converted_val, _, _, _ = convert(
-                            Decimal("0"), db_currency, db_currency.exchange_currency
-                        )
-                        exchanged_details_for_db_currency[field] = (
-                            converted_val if converted_val is not None else Decimal("0")
-                        )
+                    exchanged_details_for_db_currency = _build_exchanged_block(
+                        db_currency,
+                        db_currency.exchange_currency,
+                        currency_data_for_db_currency,
+                        as_of,
+                    )
 
                     currency_data_for_db_currency["exchanged"] = (
                         exchanged_details_for_db_currency
@@ -298,24 +308,40 @@ def calculate_currency_totals(
             "total_final": data_consolidated_currency["total_final"],
         }
 
+        consolidated_statuses = []
+        consolidated_observations = []
+
         if currency_id_consolidated in currencies_using_exchange:
             for original_currency_info in currencies_using_exchange[
                 currency_id_consolidated
             ]:
                 exchanged_values_from_original = original_currency_info["exchanged"]
-                for field in [
-                    "expense_current",
-                    "expense_projected",
-                    "income_current",
-                    "income_projected",
-                    "total_current",
-                    "total_projected",
-                    "total_final",
-                ]:
-                    if field in exchanged_values_from_original:
-                        consolidated_data[field] += exchanged_values_from_original[
-                            field
-                        ]
+                consolidated_statuses.append(
+                    exchanged_values_from_original.get("status")
+                )
+                if exchanged_values_from_original.get("observation_id"):
+                    consolidated_observations.append(
+                        exchanged_values_from_original["observation_id"]
+                    )
+                for field in CONVERTED_FIELDS:
+                    incoming = exchanged_values_from_original.get(field)
+                    if incoming is not None:
+                        consolidated_data[field] += incoming
+
+        # Explicit missing state propagates: consolidated totals are only fully
+        # converted when every source block converted successfully.
+        if consolidated_statuses and all(
+            status == ConversionStatus.OK.value
+            for status in consolidated_statuses
+        ):
+            consolidated_data["status"] = ConversionStatus.OK.value
+        elif consolidated_statuses:
+            consolidated_data["status"] = next(
+                status
+                for status in consolidated_statuses
+                if status != ConversionStatus.OK.value
+            )
+        consolidated_data["observation_ids"] = consolidated_observations
 
         result[currency_id_consolidated]["consolidated"] = consolidated_data
 
@@ -379,60 +405,36 @@ def calculate_percentage_distribution(currency_totals):
 
         # If there's exchanged data, calculate percentages for that too
         if "exchanged" in data:
+            exchanged_data = data["exchanged"]
+
+            def _exval(field):
+                value = exchanged_data.get(field)
+                return value if value is not None else Decimal("0")
+
             exchanged_total = sum(
-                [
-                    abs(data.get("exchanged", {}).get("income_current", Decimal("0"))),
-                    abs(
-                        data.get("exchanged", {}).get("income_projected", Decimal("0"))
-                    ),
-                    abs(data.get("exchanged", {}).get("expense_current", Decimal("0"))),
-                    abs(data.get("exchanged", {}).get("income_current", Decimal("0"))),
+                abs(_exval(field))
+                for field in [
+                    "income_current",
+                    "income_projected",
+                    "expense_current",
+                    "expense_projected",
                 ]
             )
 
             percentages[currency_id]["exchanged"] = {
-                "currency": data["exchanged"]["currency"],
+                "currency": exchanged_data["currency"],
                 "percentages": {},
             }
 
             if exchanged_total > 0:
                 percentages[currency_id]["exchanged"]["percentages"] = {
-                    "income_current": (
-                        abs(
-                            data.get("exchanged", {}).get(
-                                "income_current", Decimal("0")
-                            )
-                        )
-                        / exchanged_total
-                    )
-                    * 100,
-                    "income_projected": (
-                        abs(
-                            data.get("exchanged", {}).get(
-                                "income_projected", Decimal("0")
-                            )
-                        )
-                        / exchanged_total
-                    )
-                    * 100,
-                    "expense_current": (
-                        abs(
-                            data.get("exchanged", {}).get(
-                                "expense_current", Decimal("0")
-                            )
-                        )
-                        / exchanged_total
-                    )
-                    * 100,
-                    "expense_projected": (
-                        abs(
-                            data.get("exchanged", {}).get(
-                                "income_current", Decimal("0")
-                            )
-                        )
-                        / exchanged_total
-                    )
-                    * 100,
+                    field: (abs(_exval(field)) / exchanged_total) * 100
+                    for field in [
+                        "income_current",
+                        "income_projected",
+                        "expense_current",
+                        "expense_projected",
+                    ]
                 }
             else:
                 percentages[currency_id]["exchanged"]["percentages"] = {
@@ -445,7 +447,9 @@ def calculate_percentage_distribution(currency_totals):
     return percentages
 
 
-def calculate_account_totals(transactions_queryset, ignore_empty=False):
+def calculate_account_totals(
+    transactions_queryset, ignore_empty=False, as_of=None
+):
     # Prepare the aggregation expressions
     account_totals = transactions_queryset.values(
         "account",
@@ -556,40 +560,16 @@ def calculate_account_totals(transactions_queryset, ignore_empty=False):
             "total_final": total_final,
         }
 
-        # Add exchanged values if exchange_currency exists
+        # Add exchanged values if exchange_currency exists. The exchanged
+        # block is always attached when an exchange currency is configured,
+        # carrying an explicit status when conversion is impossible.
         if exchange_currency:
-            exchanged = {}
-
-            # Convert each value
-            for field in [
-                "expense_current",
-                "expense_projected",
-                "income_current",
-                "income_projected",
-                "total_current",
-                "total_projected",
-                "total_final",
-            ]:
-                amount, prefix, suffix, decimal_places = convert(
-                    amount=account_data[field],
-                    from_currency=currency,
-                    to_currency=exchange_currency,
-                )
-
-                if amount is not None:
-                    exchanged[field] = amount
-                    if "currency" not in exchanged:
-                        exchanged["currency"] = {
-                            "prefix": prefix,
-                            "suffix": suffix,
-                            "decimal_places": decimal_places,
-                            "code": exchange_currency.code,
-                            "name": exchange_currency.name,
-                        }
-
-            # Only add exchanged data if at least one conversion was successful
-            if exchanged:
-                account_data["exchanged"] = exchanged
+            account_data["exchanged"] = _build_exchanged_block(
+                currency,
+                exchange_currency,
+                account_data,
+                as_of,
+            )
 
         result[account_id] = account_data
 

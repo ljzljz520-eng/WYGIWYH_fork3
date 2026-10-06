@@ -119,7 +119,7 @@
           {#    Exchange Rate#}
           {% if not dummy %}
             {% with exchanged=transaction.exchanged_amount %}
-              {% if exchanged %}
+              {% if exchanged and exchanged.status == "ok" %}
                 <div class="exchanged-amount mb-2 lg:mb-0">
                   <c-amount.display
                       :amount="exchanged.amount"
@@ -127,6 +127,25 @@
                       :suffix="exchanged.suffix"
                       :decimal_places="exchanged.decimal_places"
                       color="grey"></c-amount.display>
+                </div>
+                <div class="text-xs opacity-50 mt-1"
+                     data-tippy-content="{% blocktranslate with provider=exchanged.provider effective_date=exchanged.effective_date obs_id=exchanged.observation_id %}Observation #{{ obs_id }} from {{ provider }}, effective {{ effective_date }}{% endblocktranslate %}">
+                  <i class="fa-solid fa-circle-info fa-fw"></i>
+                  {{ exchanged.provider }} · {{ exchanged.effective_date }}
+                  {% if exchanged.fallback %}
+                    <span class="text-warning">({% trans "fallback" %})</span>
+                  {% endif %}
+                </div>
+              {% elif exchanged %}
+                {# Original amount stays visible above; conversion is not silently zero. #}
+                <div class="text-xs text-warning mt-1"
+                     data-tippy-content="{% trans 'No valid rate observation as of the transaction date.' %}">
+                  <i class="fa-solid fa-triangle-exclamation fa-fw"></i>
+                  {% if exchanged.status == "missing_stale" %}
+                    {% trans "Rate too old" %}
+                  {% else %}
+                    {% trans "Rate unavailable" %}
+                  {% endif %}
                 </div>
               {% endif %}
             {% endwith %}
